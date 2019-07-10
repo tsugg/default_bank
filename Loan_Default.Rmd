@@ -1,0 +1,642 @@
+---
+title: "Predicting Loan Default for a Bank"
+output:
+  html_document:
+    df_print: paged
+---
+
+**Name**: Thomas Sugg
+**G Number**: G********
+
+
+```{r}
+# Add all library you will need here
+library(tidyverse)
+library(randomForest)
+library(factoextra)
+library(corrplot)
+library(rpart)
+library(rpart.plot)
+library(kknn)
+library(MASS)
+library(ISLR)
+
+# This will read in the data frame
+loan_data <- readRDS(file = "/cloud/project/Final Project/loan_data.rds")
+
+# Create training and test data
+set.seed(314)
+train_index <- sample(1:nrow(loan_data), floor(0.7*nrow(loan_data)))
+
+# training
+loan_training <- loan_data[train_index, ]
+
+# test
+loan_test <- loan_data[-train_index, ]
+
+# Function for analyzing confusion matrices
+cf_matrix <- function(actual_vec, pred_prob_vec, positive_val, 
+                      cut_prob = 0.5, search_cut = FALSE) {
+  
+  if (search_cut == FALSE) {
+  actual <- actual_vec == positive_val; pred <- pred_prob_vec >= cut_prob
+  P <- sum(actual); N <- length(actual) - P; TP <- sum(actual & pred)
+  FN <- P - TP; TN <- sum(!(actual) & !(pred)); FP <- N - TN
+  
+  if (TP != 0) { Precision <- TP/(TP + FP); Recall <- TP/(TP + FN)
+                 F1 <- 2*((Precision*Recall)/(Precision + Recall))}
+  
+  if(TP == 0) { Precision = 0; Recall = 0; F1 = 0 }
+ 
+  model_results <- list(confusion_matrix = 
+    data.frame(metric = c("Correct", "Misclassified", "True Positive",
+                           "True Negative","False Negative", "False Positive"),
+               observations = c(TN + TP, FN + FP, TP, TN, FN, FP),
+               rate = c((TN + TP)/(N + P), (FN + FP)/(N + P), TP/P, TN/N, FN/P, FP/N),
+               pct_total_obs = c((TN + TP), (FN + FP), TP, TN, FN, FP)*(1/(N + P)),
+               stringsAsFactors = FALSE),
+    F1_summary = 
+    data.frame(metric = c("Precision", "Recall", "F1 Score"),
+               value = c(Precision, Recall, F1),
+               stringsAsFactors = FALSE))
+return(model_results) } 
+ 
+  if (search_cut == TRUE) {
+    optimal_cut = data.frame(cut_prob = seq(0,1, by = 0.05),
+                             correct_rate = NA, F1_score = NA,
+                             false_pos_rate = NA, false_neg_rate = NA)
+    
+    for (row in (1:nrow(optimal_cut))) {
+      actual <- actual_vec == positive_val 
+      pred <- pred_prob_vec >= optimal_cut$cut_prob[row]
+      P <- sum(actual); N <- length(actual) - P
+      TP <- sum(actual & pred); FN <- P - TP
+      TN <- sum(!(actual) & !(pred)); FP <- N - TN
+  
+      if (TP != 0) { Precision <- TP/(TP + FP); Recall <- TP/(TP + FN)
+          F1 <- 2*((Precision*Recall)/(Precision + Recall))}
+  
+      if(TP == 0) { Precision = 0; Recall = 0; F1 = 0 }
+      
+      optimal_cut[row, 2:5] <- c((TN + TP)/(N + P), F1, FP/N, FN/P)
+    } 
+return(optimal_cut)
+  }
+}
+
+```
+
+
+
+
+**Loan Data**
+
+The loan_data data frame contains information on 3-year loans that were originated in 2013 by a local bank for
+customers residing in the United States. The company is looking to see if it can determine the factors that lead to
+loan default and whether it can predict if a customer will eventually default on their loan at time of loan
+origination. The goal is to become better at identifying customers at risk of defaulting on their loans to minimize
+the bank’s financial losses.
+
+The dataset contains a mixture of applicant demographics (gender, age, residence, etc..), financial information
+(income, debt ratios, FICO scores, etc..), and applicant behavior (number of open accounts, historical engagement
+with the bank’s products, number of missed payments, etc...)
+
+**Specifically, the broad questions that the bank is trying to answer include:**
+
+1. What are the factors that contribute to customers defaulting on their loans?
+2. Is it possible to predict whether a customer will default on their loan? If so, how accurate are the
+predictions?
+3. How many costly errors does the predictive model produce (customers classified as not defaulting,
+but eventually do)?
+
+
+
+
+
+**Exporatory Data Analysis Section**
+
+**1. Does the loan amount and the loan proportion of income determine loan default?**
+
+Findings: No, loan amount and loan proportion of income do not appear to have an effect on loan default. For default "Yes" and "No", both scatter plots look the same.
+
+
+```{r}
+
+loan_amnt_graph <- ggplot(data = loan_data, mapping = aes(x = loan_amnt, y = pct_loan_income, color = loan_default)) +
+                          geom_jitter(alpha = 0.4) +
+                          facet_wrap(~loan_default, nrow = 2)+
+                          labs(title = "Loan Default Rates by Loan Amount
+                               and Loan Proportion of Income",
+                            x = "Loan Amount",
+                            y = "Loan as a Proportion of Adjusted Income") 
+
+loan_amnt_graph
+```
+
+
+**2. Do loan default rates differ by location of residence and type of residence?**
+
+Findings: Yes, customers who rent and own in the Northeast and Midwest have higher default rates than other customers. Default rates in these areas are more than double the rates in the West, Mid-Atlantic, South, and Southwest.
+
+```{r}
+default_by_residence <- loan_data %>% group_by(us_region_residence, residence_property) %>% summarise(total_customers = n(),
+                                                                        customers_who_defaulted = sum(loan_default == "Yes"),
+                                                                        default_rate = customers_who_defaulted/total_customers) 
+arrange(default_by_residence, desc(default_rate))
+```
+
+
+
+**3. Do loan default rates differ by education?**
+
+Findings: Yes, customers with the two lowest levels of education have the highest deault rates. Interestingly, customers with the highest level of education have the third highest default rate. 
+
+
+```{r}
+
+default_by_education <- loan_data %>% group_by(highest_ed_level) %>% summarise(total_customers = n(),
+                                                                        customers_who_defaulted = sum(loan_default == "Yes"),
+                                                                        default_rate = customers_who_defaulted / total_customers)
+arrange(default_by_education, desc(default_rate))
+
+
+```
+
+
+**4. Do loan default rates differ by income bracket? Income levels determined by the Pew Research Center in 2017.**
+
+(lower = less than $39,500).
+(middle = between $39,500 and $118,000).
+(upper = more than $118,000).
+
+Findings: Yes, default rates decrease as income increases.
+
+
+```{r}
+
+
+income_levels <-cut(x = loan_data$adjusted_annual_inc,
+                    breaks = c(-Inf, 39500, 118000, Inf),
+                    labels = c("lower","middle","upper"),
+                    right = TRUE)
+
+income_levels_data <- cbind(loan_data, income_levels)
+
+income_levels_data %>% group_by(income_levels) %>% summarise(total_customers = n(),
+                                                                              customers_who_defaulted = sum(loan_default == "Yes"),
+                                                                              default_rate = customers_who_defaulted/total_customers)
+
+
+```
+
+
+**5. Is there an interaction between customer credit history and default rate? FICO score levels replicate those of Experian.**
+
+(very poor = between 300 and 579).
+(fair = between 580 and 669).
+(good = between 670 and 739).
+(very good = between 740 and 799).
+(exceptional = between 800 and 850).
+
+Findings: Yes, lower FICO scores appear to have a higher default rate. The same can be said about credit inquiries.
+
+
+```{r}
+
+
+fico_levels <-cut(x = loan_data$fico_score,
+                    breaks = c(-Inf, 580, 670, 740, 800, 850),
+                    labels = c("Very Poor","Fair","Good","Very Good","Exceptional"),
+                    right = TRUE)
+
+loan_fico_data <- cbind(loan_data, fico_levels)
+
+default_by_fico <- loan_fico_data %>% group_by(fico_levels) %>% summarise(total_customers = n(),
+                                                                              number_of_credit_inquiries = sum(inq_last_6mths),
+                                                                              customers_who_defaulted = sum(loan_default == "Yes"),
+                                                                              default_rate = customers_who_defaulted/total_customers)
+default_by_fico
+
+
+
+fico_default_graph <- ggplot(data = default_by_fico, mapping = aes(x = fico_levels, y = default_rate, fill = fico_levels)) +
+                             geom_bar(stat = "identity") +
+                             labs(title = "Loan Default Rates by FICO score",
+                                  x = "FICO Score",
+                                  y = "Default Rate")
+fico_default_graph
+
+```
+
+
+**6. Is there a relationship between gender and age that may predict default rates?**
+
+Findings: Yes, men consistently have higher default rates than women. As both genders become older, their default rates tend to decrease; however, default rates increase at the last two age categories. 
+
+
+```{r}
+
+default_by_gender <- loan_data %>% group_by(gender,age_category) %>%  summarise(total_customers = n(),
+                                                                  customers_who_defaulted = sum(loan_default == "Yes"),
+                                                                  default_rate = customers_who_defaulted/total_customers)
+arrange(default_by_gender, desc(default_rate))
+
+
+
+
+default_gender_plot <- ggplot(default_by_gender, mapping = aes(x = age_category, y = default_rate, color = gender)) +
+                       geom_point(mapping = aes(size = default_rate)) +
+                       labs(title = "Loan Default Rate by Gender",
+                            x = "Customers Who Defaulted",
+                            y = "Defualt Rate") 
+
+                        
+default_gender_plot
+
+```
+
+**7. Does the number of accounts 120 days overdue and public bankruptcies influence default rates?**
+
+Findings: The proportion of customers who were 120 days past due and the proportion of customers who had publicly filled bankruptcy were higher for customers who defaulted. However, the difference is very small and may prove unimportant in variable selection.    
+
+```{r}
+
+default_by_bankruptcies <- loan_data %>% group_by(loan_default) %>% summarise(number_of_customers = n(),
+                                                                               num_accounts_open = sum(num_accts_ever_120_pd),
+                                                                               num_bankruptcies = sum(pub_rec_bankruptcies),
+                                                                            prop_acct_overdue = num_accounts_open/ number_of_customers,
+                                                                            prop_bankruptcies = num_bankruptcies / number_of_customers)
+default_by_bankruptcies
+
+```
+
+**8. Does a customer's debt to income ratio influence default rates?**
+
+Findings: Customers who defaulted have a higher median debt to income ratio. However, it is only a small difference compared to those who did not default.
+
+
+```{r}
+
+default_by_dti <- loan_data %>% group_by(loan_default) 
+
+default_by_dti
+
+default_dti_plot <- ggplot(data = default_by_dti, mapping = aes(x = reorder(loan_default, dti, FUN = 
+                                                                            median), y = dti, fill = loan_default)) +
+                                 geom_boxplot() +
+                                 labs(title = "Default Rate by Debt to Income Ratio",
+                                      x = "Default Yes / No",
+                                      y = "Debt to Income Ratio")
+default_dti_plot
+
+```
+
+
+**9. Is there a relationship between bank utility score and loan default?**
+
+Findings: No, bank utility scores appears to be spread similarly for default "Yes" and defualt "No". 
+
+```{r}
+
+default_by_bc <- ggplot(data = loan_data, mapping = aes(x = reorder(loan_default, bc_util, FUN = 
+                                                                            median), y = bc_util, fill = loan_default)) +
+                                 geom_violin() +
+                                 geom_jitter(width = 0.07, alpha = 0.5) +
+                                 labs(title = "Default Rate by Bank Utility Score",
+                                      x = "Default Yes / No",
+                                      y = "Bank Utility Score")
+default_by_bc
+
+```
+
+
+
+
+
+**Variable Selection**
+
+**Random Forest Variable Importance**
+
+By using the varImpPlot function in Random Forests, the most important variables in this data set are determined. The "elbow" method can help eliminate variables that are the least important on the Gini index. After us_region_residence, the low variable importance becomes very similar throughout the rest of the list. By eliminating the variables below us_region_residence, the model will be simpler and over fitting will be avoided. The variables fico_score, highest_ed_level, and us_region_residence will be used in the predictive models. 
+
+```{r}
+
+set.seed(314)
+
+loan_rf <- randomForest(loan_default ~., data = loan_training, importance = TRUE)
+
+varImpPlot(loan_rf, type = 2, pch = 19, main = "Variable Importance in the Loan Data Set")
+
+
+```
+
+
+
+
+
+**Predictive Modeling**
+
+
+**Random Forests Classification: Predicting loan_default**
+
+```{r}
+#First, the model is fit using randomForest() on the training data.
+set.seed(314)
+
+loan_rf_training <- randomForest(loan_default ~ fico_score + highest_ed_level + us_region_residence,
+                                 data = loan_training, importance = TRUE)
+
+```
+
+
+ 
+
+```{r}
+#Second, a results table is made.
+loan_rf_training_results <- data.frame(loan_training,
+                                       rforest_pred_0.5 = predict(loan_rf_training,
+                                                                  newdata = loan_training,
+                                                                  type = "response"), predict(loan_rf_training,
+                                                                                              newdata = loan_training,
+                                                                                              type = "prob"))
+
+loan_rf_training_results  %>% dplyr::select(loan_default, rforest_pred_0.5, Yes, No) %>% slice(1:10)
+
+```
+
+The training results table is passed through the confusion matrix function and the optimal cut-off is determined. In this case, the optimal cut is 0.1 with an F1 score of 0.738.
+
+```{r}
+
+cf_matrix(actual_vec = loan_rf_training_results$loan_default,
+          pred_prob_vec = loan_rf_training_results$Yes,
+          positive_val = "Yes", search_cut = TRUE)
+
+
+```
+
+The random forest model, which was fit on the training data, will now be used on the test data.
+
+```{r}
+
+#The test results table is made.
+loan_rf_test_results <- data.frame(loan_test,
+                                   rf_pred_0.5 = predict(loan_rf_training,
+                                                         newdata = loan_test,
+                                                         type = "response"),
+                                   predict(loan_rf_training,
+                                           newdata = loan_test,
+                                           type = "prob"))
+loan_rf_test_results %>%  dplyr::select(loan_default, rf_pred_0.5, Yes, No) %>% slice(1:10)
+
+```
+
+
+The random forest test results will now be passed through the confusion matrix to determine the F1 score and False Negative observations. The optimal cut-off from the training data set will be used. These numbers will be compared with the next 2 models. 
+
+
+```{r}
+
+cf_matrix(actual_vec = loan_rf_test_results$loan_default,
+          pred_prob_vec = loan_rf_test_results$Yes,
+          positive_val = "Yes", cut_prob = .1)
+
+```
+
+Results:
+
+Training - F1 = 0.738
+           False Negative = 0.152
+
+Test - F1 = 0.567
+       False Negative = 0.399
+
+
+**Decision Tree Classification: Predicting loan_default**
+
+
+```{r}
+#First, the Decision Tree model will be fit on the training data.
+set.seed(314)
+
+loan_tree_training <- rpart(loan_default ~ fico_score + highest_ed_level + us_region_residence, 
+                            data = loan_training,
+                            method = "class",
+                            control = rpart.control(cp = 0, minbucket = 4))
+```
+
+The results table is created and the optimal cp is found. The optimal cp in the training model is 0.0084.
+
+```{r}
+
+cp_results <- loan_tree_training$cptable %>% data.frame()
+round(cp_results, 5)
+loan_tree_training$cptable
+cp_results %>% filter(xerror == min(xerror)) %>% mutate(lower_value = xerror - xstd,
+                                                        upper_value = xerror + xstd)
+                            
+
+```
+
+
+
+```{r}
+#The Decision Tree is pruned using the new cp.
+loan_pruned <- prune(loan_tree_training, cp = 0.0084)
+
+rpart.plot(loan_pruned, type = 4, extra = 103, digits = -3,
+           box.palette = "GnBu",
+           branch.lty = 3, branch.lwd = 3,
+           shadow.col = "gray", gap = 0, tweak = 1.0)
+
+```
+
+
+
+```{r}
+#The Decision Tree results table is made for the training data.
+loan_tree_results <- data.frame(loan_training,
+                                predict(loan_pruned,
+                                        newdata = loan_training,
+                                        type = "prob"))
+
+loan_tree_results %>%  dplyr::select(loan_default, Yes, No) %>% slice(1:10)
+
+```
+
+The confusion matrix is used on the results table to determine the F1 score and optimal cut-off. In this case, the F1 score is 0.6457 and the cut-off is 0.375.
+
+```{r}
+
+cf_matrix(actual_vec = loan_tree_results$loan_default,
+          pred_prob_vec = loan_tree_results$Yes,
+          positive_val = "Yes", search_cut = TRUE)
+
+```
+
+Now, the Decision Tree model will be fit on the test data.
+
+
+```{r}
+#The results table is created.
+loan_tree_test <- data.frame(loan_test,
+                             predict(loan_pruned,
+                                     newdata = loan_test,
+                                     type = "prob"))
+loan_tree_test %>% dplyr::select(loan_default, Yes, No) %>% slice(1:10)
+
+
+```
+
+
+```{r}
+
+loan_tree_test <- loan_tree_test %>% mutate(tree_pred_0.3 = ifelse(Yes >= 0.375, "Yes", "No"))
+table(loan_tree_test$loan_default, loan_tree_test$tree_pred_0.3)
+
+```
+
+The confusion matrix will show the F1 score and the count of False Negative observations.
+
+```{r}
+
+cf_matrix(actual_vec = loan_tree_test$loan_default,
+          pred_prob_vec = loan_tree_test$Yes,
+          positive_val = "Yes", cut_prob = 0.375)
+
+```
+
+Results:
+
+Training - F1 = 0.646
+           False Negative = 0.448
+
+Test - F1 = 0.516
+       False Negative = 0.588
+
+**KNN Classification: Predicting loan_default**
+
+
+
+```{r}
+#First, the optimal k is found. In this case, it is 28.
+set.seed(314)
+
+train.kknn(loan_default ~ fico_score + highest_ed_level + us_region_residence,
+          data = loan_training,
+          kmax = 40)
+
+```
+
+
+
+```{r}
+#Next, a model is fit on the training data using the optimal k. A results table is also created.
+set.seed(314)
+
+loan_knn_training <- kknn(loan_default ~ fico_score + highest_ed_level + us_region_residence,
+                          train = loan_training,
+                          test = loan_training,
+                          k = 28,
+                          distance = 2)
+loan_knn_training_results <- data.frame(loan_training,
+                                        knn_pred_0.5 = loan_knn_training$fitted.values,
+                                        loan_knn_training$prob)
+
+loan_knn_training_results %>% dplyr::select(loan_default, knn_pred_0.5, Yes, No) %>% slice(1:10)
+
+
+```
+
+A confusion matrix is constructed to find the F1 score and optimal cut-off for the KNN model on the training data set. In this case, the F1 score is 0.714 and the optimal cut-off is 0.4.
+
+```{r}
+
+cf_matrix(actual_vec = loan_knn_training_results$loan_default,
+          pred_prob_vec = loan_knn_training_results$Yes,
+          positive_val = "Yes", search_cut = TRUE)
+
+```
+
+
+Now, the KNN model is fit on the test data set using the optimal k and cut-off from the training set.
+
+```{r}
+set.seed(314)
+
+knn_loan_test <- kknn(loan_default ~ fico_score + highest_ed_level + us_region_residence,
+                      train = loan_training,
+                      test = loan_test,
+                      k = 28, distance = 2)
+```
+
+
+
+```{r}
+#The results table is made.
+knn_results_test <- data.frame(loan_test,
+                               knn_pred_0.5 = knn_loan_test$fitted.values,
+                               knn_loan_test$prob)
+
+knn_results_test <- knn_results_test %>% mutate(knn_pred_0.4 = ifelse(Yes >= 0.4, "Yes", "No"))
+
+knn_results_test %>% dplyr::select(loan_default, knn_pred_0.4, Yes, No) %>% slice(1:10)
+
+```
+
+
+A confusion matrix is made to determine the F1 score and the number of False Negative observations.
+
+```{r}
+
+cf_matrix(actual_vec = knn_results_test$loan_default,
+          pred_prob_vec = knn_results_test$Yes,
+          positive_val = "Yes",
+          cut_prob = 0.4)
+
+```
+
+Results:
+
+Training - F1 = 0.714
+           False Negative = 0.325
+
+Test - F1 = 0.566
+       False Negative = 0.50
+
+
+**Summary of Findings and Recommendations**
+
+Training
+                F1 Score        False Negative Rate
+Random Forest    0.738               0.152
+Decision Tree    0.646               0.448
+KNN              0.714               0.325
+
+
+Test
+                F1 Score        False Negative Rate    False Negative Percent of Observations
+Random Forest    0.567               0.399                              9%
+Decision Tree    0.516               0.588                             13%
+KNN              0.566               0.500                             11%
+
+
+The Exploratory Data Analysis was successful in demonstrating what interactions existed in the data set. Findings from the EDA were then supported by the Gini index. Although the EDA showed that variables like adjusted_annual_inc and age_category have a relationship with loan_default, the model appeared to make accurate decisions without these variables. By only using fico_score, highest_ed_level, and us_region_residence, the model remained simple and relatively accurate. 
+
+The classification model that provided the best results was the Random Forest.
+
+```{r}
+
+cf_matrix(actual_vec = loan_rf_test_results$loan_default,
+          pred_prob_vec = loan_rf_test_results$Yes,
+          positive_val = "Yes", cut_prob = .1)
+
+```
+
+The Random Forest model has the highest F1 score and the lowest False Negative Rate. As a bank, the situation that would result in the highest risk is predicting that a customer will not default on their loan; however, the customer actually defaults on their loan. This situation can be observed in the model as the False Negative. The Random Forest model has the lowest False Negative Rate. Out of the total observations, the Random Forest model predicted 9% False Negatives. 79% of the observations were classified correctly. 
+
+
+The results of the Random Forest model are a good start for the bank. In order to improve predictions, it would be best if the bank could provide even more data. Perhaps there are also unknown variables that are important in predicting if a customer will default. In the meantime, the bank now has a fairly accurate way to predict default rates. 
+
+
+
