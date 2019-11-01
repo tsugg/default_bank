@@ -1,4 +1,7 @@
 # default_bank
+
+EDIT : This was my first data science project ever. It was for a data mining class in R that I completed in my senior year of college. I really enjoyed using R, but most of the projects I post on here will be in Python. 
+
 The loan_data data frame contains information on 3-year loans that were originated in 2013 by a local bank for customers 
 residing in the United States. The company is looking to see if it can determine the factors that lead to loan default and 
 whether it can predict if a customer will eventually default on their loan at time of loan origination. The goal is to 
